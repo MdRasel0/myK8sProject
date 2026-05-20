@@ -1,0 +1,119 @@
+name: Deploy to AWS EKS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER_NAME: production-eks-cluster
+  NAMESPACE: production
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: 1.5.0
+
+    - name: Terraform Init
+      working-directory: ./terraform
+      run: terraform init
+
+    - name: Terraform Plan
+      working-directory: ./terraform
+      run: terraform plan -out=tfplan
+
+    - name: Terraform Apply
+      working-directory: ./terraform
+      run: terraform apply -auto-approve tfplan
+
+  build-and-deploy:
+    needs: terraform
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Configure kubectl
+      run: |
+        aws eks update-kubeconfig --region $AWS_REGION --name $CLUSTER_NAME
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+
+    - name: Build and Push Docker Images
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        # Frontend
+        docker build -t $ECR_REGISTRY/frontend:$IMAGE_TAG ./frontend
+        docker push $ECR_REGISTRY/frontend:$IMAGE_TAG
+        docker tag $ECR_REGISTRY/frontend:$IMAGE_TAG $ECR_REGISTRY/frontend:latest
+        docker push $ECR_REGISTRY/frontend:latest
+        
+        # Gateway
+        docker build -t $ECR_REGISTRY/gateway:$IMAGE_TAG ./gateway
+        docker push $ECR_REGISTRY/gateway:$IMAGE_TAG
+        docker tag $ECR_REGISTRY/gateway:$IMAGE_TAG $ECR_REGISTRY/gateway:latest
+        docker push $ECR_REGISTRY/gateway:latest
+        
+        # BM Chat
+        docker build -t $ECR_REGISTRY/bm-chat:$IMAGE_TAG ./bm-chat
+        docker push $ECR_REGISTRY/bm-chat:$IMAGE_TAG
+        docker tag $ECR_REGISTRY/bm-chat:$IMAGE_TAG $ECR_REGISTRY/bm-chat:latest
+        docker push $ECR_REGISTRY/bm-chat:latest
+        
+        # Backend
+        docker build -t $ECR_REGISTRY/backend:$IMAGE_TAG ./backend
+        docker push $ECR_REGISTRY/backend:$IMAGE_TAG
+        docker tag $ECR_REGISTRY/backend:$IMAGE_TAG $ECR_REGISTRY/backend:latest
+        docker push $ECR_REGISTRY/backend:latest
+
+    - name: Update Kubernetes Manifests
+      env:
+        ACCOUNT_ID: ${{ steps.login-ecr.outputs.registry }}
+      run: |
+        ACCOUNT_ID=$(echo $ACCOUNT_ID | cut -d'.' -f1)
+        find k8s/manifests -name "*.yaml" -exec sed -i "s|<ACCOUNT_ID>|$ACCOUNT_ID|g" {} \;
+        find k8s/manifests -name "*.yaml" -exec sed -i "s|<REGION>|$AWS_REGION|g" {} \;
+
+    - name: Deploy to EKS
+      run: |
+        kubectl apply -f k8s/manifests/
+        kubectl apply -f k8s/autoscaling/hpa-all.yaml
+        
+    - name: Wait for Rollout
+      run: |
+        kubectl rollout status deployment/frontend -n $NAMESPACE
+        kubectl rollout status deployment/gateway -n $NAMESPACE
+        kubectl rollout status deployment/bm-chat -n $NAMESPACE
+        kubectl rollout status deployment/backend -n $NAMESPACE
+
+    - name: Get Application URL
+      run: |
+        echo "Application URL:"
+        kubectl get ingress application-ingress -n $NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'

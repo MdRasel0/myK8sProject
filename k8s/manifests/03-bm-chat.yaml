@@ -1,0 +1,97 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bm-chat
+  namespace: production
+  labels:
+    app: bm-chat
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: bm-chat
+  template:
+    metadata:
+      labels:
+        app: bm-chat
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8081"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+      - name: bm-chat
+        image: <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/bm-chat:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8081
+          name: http
+          protocol: TCP
+        env:
+        - name: CASSANDRA_ENDPOINT
+          valueFrom:
+            secretKeyRef:
+              name: database-secrets
+              key: cassandra-endpoint
+        - name: CASSANDRA_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: database-secrets
+              key: cassandra-username
+        - name: CASSANDRA_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: database-secrets
+              key: cassandra-password
+        - name: CASSANDRA_KEYSPACE
+          valueFrom:
+            secretKeyRef:
+              name: database-secrets
+              key: keyspace
+        - name: KAFKA_BROKERS
+          valueFrom:
+            configMapKeyRef:
+              name: kafka-config
+              key: brokers
+        - name: SPRING_PROFILES_ACTIVE
+          value: "production"
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /actuator/health/liveness
+            port: 8081
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /actuator/health/readiness
+            port: 8081
+          initialDelaySeconds: 30
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bm-chat
+  namespace: production
+  labels:
+    app: bm-chat
+spec:
+  type: ClusterIP
+  selector:
+    app: bm-chat
+  ports:
+  - port: 8081
+    targetPort: 8081
+    protocol: TCP
+    name: http
